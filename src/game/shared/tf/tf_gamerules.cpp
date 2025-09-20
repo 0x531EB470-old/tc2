@@ -16290,19 +16290,73 @@ void CTFGameRules::ClientCommandKeyValues( edict_t *pEntity, KeyValues *pKeyValu
 		{
 			BroadcastDrawLine( pTFPlayer, pKeyValues );
 		}
-		else if ( FStrEq( pszCommand, "sdk_inventory" ) )
-		{
-			CSteamID steamID;
-			if ( !pTFPlayer->GetSteamID( &steamID ) )
-				return;
+                else if ( FStrEq( pszCommand, "sdk_inventory" ) )
+                {
+                        CSteamID steamID;
+                        if ( !pTFPlayer->GetSteamID( &steamID ) )
+                                return;
 
-			GTFGCClientSystem()->ProcessPlayerInventoryRequest( steamID, pKeyValues );
-		}
-		else
-		{
-			BaseClass::ClientCommandKeyValues( pEntity, pKeyValues );
-		}
-	}
+                        GTFGCClientSystem()->ProcessPlayerInventoryRequest( steamID, pKeyValues );
+                }
+                else if ( FStrEq( pszCommand, kServerEquipWeaponCommand ) )
+                {
+                        int iClass = pKeyValues->GetInt( "class", TF_CLASS_UNDEFINED );
+                        int iSlot = pKeyValues->GetInt( "slot", LOADOUT_POSITION_INVALID );
+                        item_definition_index_t iDefIndex = pKeyValues->GetInt( "defindex", INVALID_ITEM_DEF_INDEX );
+
+                        if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS )
+                                return;
+
+                        if ( iSlot < 0 || iSlot >= CLASS_LOADOUT_POSITION_COUNT )
+                                return;
+
+                        CTFPlayerInventory *pInventory = pTFPlayer->Inventory();
+                        if ( !pInventory )
+                                return;
+
+                        bool bChanged = false;
+
+                        if ( iDefIndex == INVALID_ITEM_DEF_INDEX )
+                        {
+                                bChanged = pInventory->ClearServerLoadoutWeaponOverride( iClass, iSlot );
+                        }
+                        else
+                        {
+                                CEconItemDefinition *pItemDef = ItemSystem()->GetItemSchema()->GetItemDefinition( iDefIndex );
+                                if ( !pItemDef )
+                                        return;
+
+                                if ( TF_IsWeaponDefIndexBlacklisted( iDefIndex ) )
+                                        return;
+
+                                if ( !pItemDef->IsActingAsAWeapon() || !pItemDef->CanBeUsedByClass( iClass ) )
+                                        return;
+
+                                if ( !AreSlotsConsideredIdentical( pItemDef->GetEquipType(), pItemDef->GetLoadoutSlot( iClass ), iSlot ) )
+                                        return;
+
+                                CSteamID steamID;
+                                uint32 unAccountID = 0;
+                                if ( pTFPlayer->GetSteamID( &steamID ) )
+                                {
+                                        unAccountID = steamID.GetAccountID();
+                                }
+
+                                bChanged = pInventory->SetServerLoadoutWeaponOverride( iClass, iSlot, iDefIndex, unAccountID );
+                        }
+
+                        if ( bChanged )
+                        {
+                                pTFPlayer->CheckInstantLoadoutRespawn();
+                        }
+
+                        return;
+                }
+                else
+                {
+                        BaseClass::ClientCommandKeyValues( pEntity, pKeyValues );
+                }
+        }
 }
 
 #ifdef GAME_DLL
