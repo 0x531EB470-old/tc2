@@ -21,6 +21,23 @@
 
 #define LOADOUT_SLOT_USE_BASE_ITEM		0
 
+inline constexpr const char *kServerEquipWeaponCommand = "TC2EquipWeapon";
+
+inline bool TF_IsWeaponDefIndexBlacklisted( item_definition_index_t defIndex )
+{
+	switch ( defIndex )
+	{
+	case 169:
+	case 423:
+	case 1071:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool AreSlotsConsideredIdentical( EEquipType_t eEquipType, int iBaseSlot, int iTestSlot );
+
 namespace vgui
 {
 	class Panel;
@@ -83,6 +100,12 @@ public:
 	void				UnequipLocal(uint64 ulItemID);
 
 	void				OnHasNewQuest();
+
+#ifdef GAME_DLL
+	bool				SetServerLoadoutWeaponOverride( int iClass, int iSlot, item_definition_index_t iDefIndex, uint32 unAccountID );
+	bool				ClearServerLoadoutWeaponOverride( int iClass, int iSlot );
+	CEconItemView*		GetServerLoadoutWeaponOverride( int iClass, int iSlot ) const;
+#endif
 
 	static CEconItemView *GetFirstItemOfItemDef( item_definition_index_t nDefIndex, CPlayerInventory* pInventory = NULL );
 
@@ -149,6 +172,9 @@ protected:
 	itemid_t		m_LoadoutItems[ TF_CLASS_COUNT ][ CLASS_LOADOUT_POSITION_COUNT ];
 	bool			m_bLoadoutChanged[ TF_CLASS_COUNT ];
 	itemid_t		m_AccountLoadoutItems[ ACCOUNT_LOADOUT_POSITION_COUNT ];
+#ifdef GAME_DLL
+	CEconItemView*		m_pServerLoadoutWeapons[ TF_CLASS_COUNT ][ CLASS_LOADOUT_POSITION_COUNT ];
+#endif
 
 	friend class CTFInventoryManager;
 };

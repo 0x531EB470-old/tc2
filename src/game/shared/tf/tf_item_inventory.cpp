@@ -50,6 +50,19 @@ using namespace GCSDK;
 
 #define LOCAL_LOADOUT_FILE		"cfg/local_loadout.txt"
 
+#ifdef GAME_DLL
+static itemid_t GenerateServerLoadoutItemID( uint32 unAccountID, int iClass, int iSlot, item_definition_index_t iDefIndex )
+{
+	const itemid_t kCustomFlag = itemid_t( 1 ) << 63;
+	itemid_t nID = kCustomFlag;
+	nID |= ( itemid_t( unAccountID ) & 0xFFFFFFFFull ) << 31;
+	nID |= ( itemid_t( iClass & 0xF ) << 27 );
+	nID |= ( itemid_t( iSlot & 0x1F ) << 22 );
+	nID |= ( itemid_t( iDefIndex ) & 0x3FFFFFull );
+	return nID;
+}
+#endif
+
 #ifdef CLIENT_DLL
 //-----------------------------------------------------------------------------
 CEconNotification_HasNewItems::CEconNotification_HasNewItems() : CEconNotification()
@@ -920,18 +933,21 @@ public:
 //-----------------------------------------------------------------------------
 CTFPlayerInventory::CTFPlayerInventory()
 {
-	m_aInventoryItems.SetLessContext( this );
+        m_aInventoryItems.SetLessContext( this );
 #ifdef CLIENT_DLL
-	for ( int i = 0; i < TF_TEAM_COUNT; ++i ) 
-		m_CachedBaseTextureLowRes[ i ].SetLessFunc( DefLessFunc( itemid_t ) );
+        for ( int i = 0; i < TF_TEAM_COUNT; ++i )
+                m_CachedBaseTextureLowRes[ i ].SetLessFunc( DefLessFunc( itemid_t ) );
 
-	memset(m_ActivePreset, LOADOUT_SLOT_USE_BASE_ITEM, sizeof(m_ActivePreset));
-	memset(m_PresetItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof(m_PresetItems));
+        memset(m_ActivePreset, LOADOUT_SLOT_USE_BASE_ITEM, sizeof(m_ActivePreset));
+        memset(m_PresetItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof(m_PresetItems));
 #endif
 
-	memset( m_LoadoutItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof( m_LoadoutItems ) );
-	memset( m_AccountLoadoutItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof( m_AccountLoadoutItems ) );
-	ClearClassLoadoutChangeTracking();
+        memset( m_LoadoutItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof( m_LoadoutItems ) );
+        memset( m_AccountLoadoutItems, LOADOUT_SLOT_USE_BASE_ITEM, sizeof( m_AccountLoadoutItems ) );
+#ifdef GAME_DLL
+        memset( m_pServerLoadoutWeapons, 0, sizeof( m_pServerLoadoutWeapons ) );
+#endif
+        ClearClassLoadoutChangeTracking();
 }
 
 //-----------------------------------------------------------------------------
@@ -940,12 +956,22 @@ CTFPlayerInventory::CTFPlayerInventory()
 CTFPlayerInventory::~CTFPlayerInventory()
 {
 #ifdef CLIENT_DLL
-	for ( int iTeam = 0; iTeam < TF_TEAM_COUNT; ++iTeam )
-	{
-		FOR_EACH_MAP_FAST( m_CachedBaseTextureLowRes[ iTeam ], i )
-			m_CachedBaseTextureLowRes[ iTeam ][ i ]->Release();
-		m_CachedBaseTextureLowRes[ iTeam ].RemoveAll();
-	}
+        for ( int iTeam = 0; iTeam < TF_TEAM_COUNT; ++iTeam )
+        {
+                FOR_EACH_MAP_FAST( m_CachedBaseTextureLowRes[ iTeam ], i )
+                        m_CachedBaseTextureLowRes[ iTeam ][ i ]->Release();
+                m_CachedBaseTextureLowRes[ iTeam ].RemoveAll();
+        }
+#endif
+#ifdef GAME_DLL
+        for ( int iClass = 0; iClass < TF_CLASS_COUNT; ++iClass )
+        {
+                for ( int iSlot = 0; iSlot < CLASS_LOADOUT_POSITION_COUNT; ++iSlot )
+                {
+                        delete m_pServerLoadoutWeapons[iClass][iSlot];
+                        m_pServerLoadoutWeapons[iClass][iSlot] = nullptr;
+                }
+        }
 #endif
 }
 
@@ -1149,17 +1175,21 @@ void CTFPlayerInventory::SaveLocalLoadout( bool bReset, bool bDefaultToGC )
 //-----------------------------------------------------------------------------
 void CTFPlayerInventory::EquipLocal(uint64 ulItemID, equipped_class_t unClass, equipped_slot_t unSlot)
 {
-	// These interactions normally result from a round-trip with the GC.
-	// We will never get those messages, so we do everything locally.
+        // These interactions normally result from a round-trip with the GC.
+        // We will never get those messages, so we do everything locally.
 
-	// Unequip whatever was previously in the slot.
-	{
-		itemid_t ulPreviousItem = m_LoadoutItems[unClass][unSlot];
-		CEconItemView *pPreviousItem = GetInventoryItemByItemID(ulPreviousItem);
-		if (pPreviousItem) {
-			pPreviousItem->GetSOCData()->UnequipFromClass(unClass);
-		}
-	}
+#ifdef GAME_DLL
+        ClearServerLoadoutWeaponOverride( unClass, unSlot );
+#endif
+
+        // Unequip whatever was previously in the slot.
+        {
+                itemid_t ulPreviousItem = m_LoadoutItems[unClass][unSlot];
+                CEconItemView *pPreviousItem = GetInventoryItemByItemID(ulPreviousItem);
+                if (pPreviousItem) {
+                        pPreviousItem->GetSOCData()->UnequipFromClass(unClass);
+                }
+        }
 
 	// Equip the new item and add it to our loadout.
 	CEconItemView *pItem = GetInventoryItemByItemID(ulItemID);
@@ -1174,16 +1204,72 @@ void CTFPlayerInventory::EquipLocal(uint64 ulItemID, equipped_class_t unClass, e
 	int activePreset = m_ActivePreset[unClass];
 	m_PresetItems[activePreset][unClass][unSlot] = ulItemID;
 
-	//GTFGCClientSystem()->LocalInventoryChanged();
-	//TFInventoryManager()->QueueGCInventoryChangeNotification();
+        //GTFGCClientSystem()->LocalInventoryChanged();
+        //TFInventoryManager()->QueueGCInventoryChangeNotification();
 #endif
 }
 
+#ifdef GAME_DLL
+bool CTFPlayerInventory::ClearServerLoadoutWeaponOverride( int iClass, int iSlot )
+{
+        if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS )
+                return false;
+
+        if ( iSlot < 0 || iSlot >= CLASS_LOADOUT_POSITION_COUNT )
+                return false;
+
+        CEconItemView *&pOverride = m_pServerLoadoutWeapons[iClass][iSlot];
+        if ( !pOverride )
+                return false;
+
+        delete pOverride;
+        pOverride = nullptr;
+        m_bLoadoutChanged[iClass] = true;
+        return true;
+}
+
+bool CTFPlayerInventory::SetServerLoadoutWeaponOverride( int iClass, int iSlot, item_definition_index_t iDefIndex, uint32 unAccountID )
+{
+        if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS )
+                return false;
+
+        if ( iSlot < 0 || iSlot >= CLASS_LOADOUT_POSITION_COUNT )
+                return false;
+
+        if ( TF_IsWeaponDefIndexBlacklisted( iDefIndex ) )
+                return false;
+
+        CEconItemView *pExisting = m_pServerLoadoutWeapons[iClass][iSlot];
+        if ( pExisting && pExisting->GetItemDefIndex() == iDefIndex )
+                return false;
+
+        ClearServerLoadoutWeaponOverride( iClass, iSlot );
+
+        CEconItemView *pNewItem = new CEconItemView;
+        pNewItem->Init( iDefIndex, AE_UNIQUE, AE_USE_SCRIPT_VALUE, unAccountID );
+        pNewItem->SetItemID( GenerateServerLoadoutItemID( unAccountID, iClass, iSlot, iDefIndex ) );
+        m_pServerLoadoutWeapons[iClass][iSlot] = pNewItem;
+        m_bLoadoutChanged[iClass] = true;
+        return true;
+}
+
+CEconItemView *CTFPlayerInventory::GetServerLoadoutWeaponOverride( int iClass, int iSlot ) const
+{
+        if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS )
+                return nullptr;
+
+        if ( iSlot < 0 || iSlot >= CLASS_LOADOUT_POSITION_COUNT )
+                return nullptr;
+
+        return m_pServerLoadoutWeapons[iClass][iSlot];
+}
+#endif
+
 void CTFPlayerInventory::UnequipLocal(uint64 ulItemID)
 {
-	for (int iClass = 1; iClass < TF_CLASS_COUNT_ALL; ++iClass)
-	{
-		for (int iSlot = 0; iSlot < CLASS_LOADOUT_POSITION_COUNT; ++iSlot)
+        for (int iClass = 1; iClass < TF_CLASS_COUNT_ALL; ++iClass)
+        {
+                for (int iSlot = 0; iSlot < CLASS_LOADOUT_POSITION_COUNT; ++iSlot)
 		{
 			if (m_LoadoutItems[iClass][iSlot] == ulItemID) {
 				m_LoadoutItems[iClass][iSlot] = 0;
@@ -1553,18 +1639,23 @@ CEconItemView *CTFPlayerInventory::GetItemInLoadout( int iClass, int iSlot )
 	if ( iSlot < 0 || iSlot >= CLASS_LOADOUT_POSITION_COUNT )
 		return NULL;
 
-	if ( iClass == GEconItemSchema().GetAccountIndex() )
-	{
-		return GetInventoryItemByItemID( m_AccountLoadoutItems[ iSlot ] );
-	}
-	else
-	{
-		if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS  )
-			return NULL;
+        if ( iClass == GEconItemSchema().GetAccountIndex() )
+        {
+                return GetInventoryItemByItemID( m_AccountLoadoutItems[ iSlot ] );
+        }
+        else
+        {
+                if ( iClass < TF_FIRST_NORMAL_CLASS || iClass >= TF_LAST_NORMAL_CLASS  )
+                        return NULL;
 
-		// If we don't have an item in the loadout at that slot, we return the base item
-		if ( m_LoadoutItems[iClass][iSlot] != LOADOUT_SLOT_USE_BASE_ITEM )
-		{
+#ifdef GAME_DLL
+                if ( m_pServerLoadoutWeapons[iClass][iSlot] )
+                        return m_pServerLoadoutWeapons[iClass][iSlot];
+#endif
+
+                // If we don't have an item in the loadout at that slot, we return the base item
+                if ( m_LoadoutItems[iClass][iSlot] != LOADOUT_SLOT_USE_BASE_ITEM )
+                {
 			CEconItemView *pItem = GetInventoryItemByItemID( m_LoadoutItems[iClass][iSlot] );
 
 			// To protect against users lying to the backend about the position of their items,
@@ -2024,12 +2115,47 @@ void CTFInventoryManager::UpdateInventoryEquippedState(CPlayerInventory *pInvent
 {
 	BaseClass::UpdateInventoryEquippedState(pInventory, ulItemID, unClass, unSlot);
 
-	CTFPlayerInventory* pTFInventory = dynamic_cast<CTFPlayerInventory*>(pInventory);
-	if (pTFInventory) 
-	{
-		pTFInventory->EquipLocal(ulItemID, unClass, unSlot);
-		pTFInventory->SaveLocalLoadout();
-	}
+        CTFPlayerInventory* pTFInventory = dynamic_cast<CTFPlayerInventory*>(pInventory);
+        if (pTFInventory)
+        {
+                pTFInventory->EquipLocal(ulItemID, unClass, unSlot);
+                pTFInventory->SaveLocalLoadout();
+
+                if ( pInventory == &m_LocalInventory && engine->IsInGame() )
+                {
+                        if ( unClass >= TF_FIRST_NORMAL_CLASS && unClass < TF_LAST_NORMAL_CLASS )
+                        {
+                                if ( ulItemID == INVALID_ITEM_ID )
+                                {
+                                        KeyValues *pKV = new KeyValues( kServerEquipWeaponCommand );
+                                        pKV->SetInt( "class", unClass );
+                                        pKV->SetInt( "slot", unSlot );
+                                        pKV->SetInt( "defindex", INVALID_ITEM_DEF_INDEX );
+                                        engine->ServerCmdKeyValues( pKV );
+                                }
+                                else
+                                {
+                                        CEconItemView *pItem = m_LocalInventory.GetInventoryItemByItemID( ulItemID );
+                                        if ( pItem )
+                                        {
+                                                CEconItemDefinition *pItemDef = pItem->GetItemDefinition();
+                                                if ( pItemDef && pItemDef->IsActingAsAWeapon() )
+                                                {
+                                                        item_definition_index_t defIndex = pItemDef->GetDefinitionIndex();
+                                                        if ( !TF_IsWeaponDefIndexBlacklisted( defIndex ) && pItemDef->CanBeUsedByClass( unClass ) && AreSlotsConsideredIdentical( pItemDef->GetEquipType(), pItemDef->GetLoadoutSlot( unClass ), unSlot ) )
+                                                        {
+                                                                KeyValues *pKV = new KeyValues( kServerEquipWeaponCommand );
+                                                                pKV->SetInt( "class", unClass );
+                                                                pKV->SetInt( "slot", unSlot );
+                                                                pKV->SetInt( "defindex", defIndex );
+                                                                engine->ServerCmdKeyValues( pKV );
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                }
+        }
 }
 
 #endif
